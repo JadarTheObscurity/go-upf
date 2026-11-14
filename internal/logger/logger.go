@@ -16,6 +16,7 @@ var (
 	PerioLog *logrus.Entry
 	FwderLog *logrus.Entry
 	EesLog   *logrus.Entry
+	LoadLog  *logrus.Entry
 )
 
 func init() {
@@ -38,4 +39,5 @@ func init() {
 	PerioLog = NfLog.WithField(logger_util.FieldCategory, "Perio")
 	FwderLog = NfLog.WithField(logger_util.FieldCategory, "FWD")
 	EesLog = NfLog.WithField(logger_util.FieldCategory, "EES")
+	LoadLog = NfLog.WithField(logger_util.FieldCategory, "Load")
 }
