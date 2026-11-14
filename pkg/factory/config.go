@@ -16,12 +16,13 @@ const (
 )
 
 type Config struct {
-	Version     string    `yaml:"version"     valid:"required,in(1.0.3)"`
-	Description string    `yaml:"description" valid:"optional"`
-	Pfcp        *Pfcp     `yaml:"pfcp"        valid:"required"`
-	Gtpu        *Gtpu     `yaml:"gtpu"        valid:"required"`
-	DnnList     []DnnList `yaml:"dnnList"     valid:"required"`
-	Logger      *Logger   `yaml:"logger"      valid:"required"`
+	Version     string      `yaml:"version"     valid:"required,in(1.0.3)"`
+	Description string      `yaml:"description" valid:"optional"`
+	Pfcp        *Pfcp       `yaml:"pfcp"        valid:"required"`
+	Gtpu        *Gtpu       `yaml:"gtpu"        valid:"required"`
+	DnnList     []DnnList   `yaml:"dnnList"     valid:"required"`
+	Logger      *Logger     `yaml:"logger"      valid:"required"`
+	Load        *LoadConfig `yaml:"load"       valid:"optional"`
 }
 
 type Pfcp struct {
@@ -57,6 +58,44 @@ type Logger struct {
 	Enable       bool   `yaml:"enable"       valid:"optional"`
 	Level        string `yaml:"level"        valid:"required,in(trace|debug|info|warn|error|fatal|panic)"`
 	ReportCaller bool   `yaml:"reportCaller" valid:"optional"`
+}
+
+// LoadConfig controls the egress load metric (0..100) that will later be
+// carried in PFCP Load Control Information (TS 29.244 8.2.54).
+//
+// The metric is floor(egress buffer bytes / max buffer bytes * 100), time
+// averaged. That requires a BYTE-limited egress queue to measure: a pod's veth
+// is "noqueue" by default and has no buffer at all, so the deployment installs
+// a bounded qdisc on a dedicated interface and names it here.
+type LoadConfig struct {
+	Enabled bool `yaml:"enabled" valid:"optional"`
+	// IfName is the interface carrying the egress buffer.
+	IfName string `yaml:"ifname" valid:"optional"`
+	// QdiscKind is the queue to measure. It must report a byte limit, so
+	// "bfifo"; pfifo's limit is in packets and yields no byte ratio.
+	QdiscKind string `yaml:"qdiscKind" valid:"optional"`
+	// SampleIntervalMs is how often the buffer is read.
+	SampleIntervalMs int `yaml:"sampleIntervalMs" valid:"optional"`
+	// AverageWindowMs is the averaging time constant. Expressed in time, not
+	// in samples, so changing the sample rate does not change the smoothing.
+	AverageWindowMs int `yaml:"averageWindowMs" valid:"optional"`
+	// APIAddr is the TEMPORARY internal verification endpoint, "ip:port".
+	// Empty disables it. Remove once the PFCP IE carries the metric.
+	APIAddr string `yaml:"apiAddr" valid:"optional"`
+
+	// SetupEgress makes the UPF build the egress buffer itself after the
+	// gtp5g link exists. This cannot be done by a startup script, because the
+	// buffer must sit on the pre-NAT user-plane path and the only interface
+	// carrying it (upfgtp) is created by the UPF process.
+	SetupEgress bool `yaml:"setupEgress" valid:"optional"`
+	// EgressSourceIf is the interface whose ingress is redirected into the
+	// buffer; normally the gtp5g link.
+	EgressSourceIf string `yaml:"egressSourceIf" valid:"optional"`
+	// EgressRate is the bottleneck in tc syntax, e.g. "500kbit". Required
+	// when SetupEgress is set: with no bottleneck the buffer never fills.
+	EgressRate string `yaml:"egressRate" valid:"optional"`
+	// EgressBufferBytes is the buffer capacity, the metric's denominator.
+	EgressBufferBytes uint32 `yaml:"egressBufferBytes" valid:"optional"`
 }
 
 func (c *Config) GetVersion() string {

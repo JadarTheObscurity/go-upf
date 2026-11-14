@@ -7,10 +7,12 @@ import (
 	"runtime/debug"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/sirupsen/logrus"
 
 	"github.com/free5gc/go-upf/internal/forwarder"
+	"github.com/free5gc/go-upf/internal/load"
 	"github.com/free5gc/go-upf/internal/logger"
 	"github.com/free5gc/go-upf/internal/pfcp"
 	"github.com/free5gc/go-upf/pkg/factory"
@@ -22,6 +24,20 @@ type UpfApp struct {
 	cfg        *factory.Config
 	driver     forwarder.Driver
 	pfcpServer *pfcp.PfcpServer
+
+	loadTracker *load.Tracker
+	loadAPI     *load.APIServer
+	loadEgress  *load.EgressBufferSpec
+}
+
+// LoadMetric exposes the current egress load metric (0..100). The PFCP layer
+// will read this when it populates Load Control Information.
+func (u *UpfApp) LoadMetric() (uint8, bool) {
+	if u.loadTracker == nil {
+		return 0, false
+	}
+	m := u.loadTracker.Metric()
+	return m.Value, m.Healthy
 }
 
 func NewApp(cfg *factory.Config) (*UpfApp, error) {
@@ -81,6 +97,14 @@ func (u *UpfApp) Run() error {
 	u.driver.HandleReport(u.pfcpServer)
 	u.pfcpServer.Start(&u.wg)
 
+	// The load metric must be available as soon as the pod is up, so it is
+	// started here, before the UPF reports itself started. A failure to set it
+	// up is logged, not fatal: it is telemetry, and the forwarding plane is
+	// already serving traffic by this point.
+	if err := u.initLoadMetric(); err != nil {
+		logger.MainLog.Errorf("load metric disabled: %v", err)
+	}
+
 	logger.MainLog.Infoln("UPF started")
 
 	// Wait for interrupt signal to gracefully shutdown
@@ -111,6 +135,16 @@ func (u *UpfApp) listenShutdownEvent() {
 	if u.pfcpServer != nil {
 		u.pfcpServer.Stop()
 	}
+	if u.loadEgress != nil {
+		load.TeardownEgressBuffer(*u.loadEgress)
+	}
+	if u.loadAPI != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := u.loadAPI.Shutdown(shutdownCtx); err != nil {
+			logger.MainLog.Errorf("Load metric API Shutdown Error: %v", err)
+		}
+	}
 	if u.driver != nil {
 		u.driver.Close()
 	}
@@ -130,4 +164,88 @@ func (u *UpfApp) Start() {
 func (u *UpfApp) Terminate() {
 	logger.MainLog.Infof("Terminating UPF...")
 	logger.MainLog.Infof("UPF terminated")
+}
+
+// initLoadMetric starts the egress load sampler and its temporary internal
+// verification API.
+func (u *UpfApp) initLoadMetric() error {
+	cfg := u.cfg.Load
+	if cfg == nil || !cfg.Enabled {
+		return nil
+	}
+
+	ifname := cfg.IfName
+	if ifname == "" {
+		ifname = "upfegress"
+	}
+	kind := cfg.QdiscKind
+	if kind == "" {
+		// bfifo is required, not merely the default: its limit is in BYTES, so
+		// backlog/limit is a byte ratio. pfifo's limit is in packets.
+		kind = "bfifo"
+	}
+	// Build the buffer first: the sampler takes its first reading immediately,
+	// so the queue must exist before it runs for the metric to be live as soon
+	// as the pod is up.
+	if cfg.SetupEgress {
+		srcIf := cfg.EgressSourceIf
+		if srcIf == "" {
+			// Fall back to the configured gtp5g link name, guarding the
+			// slice: IfList is optional in the config schema, so indexing it
+			// unconditionally would panic on a config that omits it.
+			if u.cfg.Gtpu != nil && len(u.cfg.Gtpu.IfList) > 0 {
+				srcIf = u.cfg.Gtpu.IfList[0].IfName
+			}
+			if srcIf == "" {
+				srcIf = "upfgtp"
+			}
+		}
+		bufBytes := cfg.EgressBufferBytes
+		if bufBytes == 0 {
+			bufBytes = 65536
+		}
+		u.loadEgress = &load.EgressBufferSpec{
+			IfName:     ifname,
+			SourceIf:   srcIf,
+			Rate:       cfg.EgressRate,
+			LimitBytes: bufBytes,
+		}
+		if err := load.SetupEgressBuffer(*u.loadEgress, logger.LoadLog); err != nil {
+			u.loadEgress = nil
+			return err
+		}
+	}
+
+	interval := time.Duration(cfg.SampleIntervalMs) * time.Millisecond
+	if interval <= 0 {
+		interval = 200 * time.Millisecond
+	}
+	window := time.Duration(cfg.AverageWindowMs) * time.Millisecond
+	if window <= 0 {
+		window = 2 * time.Second
+	}
+
+	u.loadTracker = load.NewTracker(interval, window, ifname)
+	sampler, err := load.NewSampler(u.loadTracker, ifname, kind, interval, logger.LoadLog)
+	if err != nil {
+		u.loadTracker = nil
+		return err
+	}
+	sampler.Run(u.ctx, &u.wg)
+	logger.MainLog.Infof(
+		"load metric enabled: %s/%s sampled every %s, averaged over %s",
+		ifname, kind, interval, window)
+
+	if cfg.APIAddr != "" {
+		u.loadAPI = load.NewAPIServer(u.loadTracker, logger.LoadLog)
+		addr := cfg.APIAddr
+		u.wg.Add(1)
+		go func() {
+			defer u.wg.Done()
+			if err := u.loadAPI.Serve(addr); err != nil {
+				logger.MainLog.Errorf("Load metric API Error: %v", err)
+			}
+		}()
+	}
+	return nil
 }
