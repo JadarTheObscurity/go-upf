@@ -20,6 +20,7 @@ type Sampler struct {
 	tracker  *Tracker
 	ifname   string
 	kind     string
+	dir      Direction
 	interval time.Duration
 	log      *logrus.Entry
 
@@ -30,8 +31,10 @@ type Sampler struct {
 	ifindex int
 }
 
-func NewSampler(tracker *Tracker, ifname, kind string, interval time.Duration,
-	log *logrus.Entry,
+// NewSampler builds a sampler for one direction's buffer. ifname is the device
+// carrying that buffer: the ifb device for uplink, the gtp5g link for downlink.
+func NewSampler(tracker *Tracker, ifname, kind string, dir Direction,
+	interval time.Duration, log *logrus.Entry,
 ) (*Sampler, error) {
 	reader, err := NewQdiscReader()
 	if err != nil {
@@ -39,7 +42,7 @@ func NewSampler(tracker *Tracker, ifname, kind string, interval time.Duration,
 	}
 	return &Sampler{
 		reader: reader, tracker: tracker, ifname: ifname,
-		kind: kind, interval: interval, log: log,
+		kind: kind, dir: dir, interval: interval, log: log,
 	}, nil
 }
 
@@ -55,7 +58,7 @@ func (s *Sampler) Run(ctx context.Context, wg *sync.WaitGroup) {
 		for {
 			select {
 			case <-ctx.Done():
-				s.log.Infof("load metric sampler stopped")
+				s.log.Infof("%s load metric sampler stopped", s.dir)
 				return
 			case <-ticker.C:
 				s.sampleOnce()
@@ -101,8 +104,8 @@ func (s *Sampler) resolveIfindex() (int, error) {
 		return 0, fmt.Errorf("egress interface %q not found: %w", s.ifname, err)
 	}
 	s.ifindex = iface.Index
-	s.log.Infof("load metric: egress buffer on %s (ifindex %d), qdisc kind %q",
-		s.ifname, iface.Index, s.kind)
+	s.log.Infof("%s load metric: buffer on %s (ifindex %d), qdisc kind %q",
+		s.dir, s.ifname, iface.Index, s.kind)
 	return s.ifindex, nil
 }
 
@@ -118,13 +121,13 @@ func (s *Sampler) resolveIfindex() (int, error) {
 
 // APIServer serves the metric over HTTP for inspection.
 type APIServer struct {
-	tracker *Tracker
-	srv     *http.Server
-	log     *logrus.Entry
+	combiner *Combiner
+	srv      *http.Server
+	log      *logrus.Entry
 }
 
-func NewAPIServer(tracker *Tracker, log *logrus.Entry) *APIServer {
-	a := &APIServer{tracker: tracker, log: log}
+func NewAPIServer(combiner *Combiner, log *logrus.Entry) *APIServer {
+	a := &APIServer{combiner: combiner, log: log}
 	mux := http.NewServeMux()
 	// Versioned under an explicitly internal path so it cannot be mistaken
 	// for a 3GPP service-based interface.
@@ -139,9 +142,9 @@ func (a *APIServer) handleGet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "only GET", http.StatusMethodNotAllowed)
 		return
 	}
-	m := a.tracker.Metric()
+	m := a.combiner.LCI()
 	w.Header().Set("Content-Type", "application/json")
-	// 503 when the sampler cannot read the buffer: a monitoring caller must be
+	// 503 when a sampler cannot read its buffer: a monitoring caller must be
 	// able to tell a real 0% from a broken measurement without parsing a body.
 	if !m.Healthy {
 		w.WriteHeader(http.StatusServiceUnavailable)

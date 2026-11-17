@@ -40,18 +40,39 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// EgressBufferSpec describes the buffer to build.
+// EgressBufferSpec describes the buffers to build.
 type EgressBufferSpec struct {
-	// IfName is the ifb device to create, e.g. "upfegress".
+	// IfName is the ifb device to create for the UPLINK buffer, e.g.
+	// "upfegress".
 	IfName string
-	// SourceIf is the interface whose ingress is redirected, normally the
-	// gtp5g link ("upfgtp"): pre-NAT, decapsulated uplink user traffic.
+	// SourceIf is the gtp5g link ("upfgtp"). Its ingress is redirected into
+	// the uplink buffer, and its egress carries the downlink buffer.
 	SourceIf string
-	// Rate is the bottleneck, in tc syntax ("500kbit"). Required: with no
-	// bottleneck the buffer never fills and the metric is always 0.
+	// Rate is the uplink bottleneck, in tc syntax ("500kbit"). Required:
+	// with no bottleneck the buffer never fills and the metric is always 0.
 	Rate string
-	// LimitBytes is the buffer capacity -- the metric's denominator.
+	// LimitBytes is the uplink buffer capacity -- the UL metric's denominator.
 	LimitBytes uint32
+
+	// DLRate is the downlink bottleneck. Empty disables the downlink buffer,
+	// in which case the metric is uplink-only.
+	DLRate string
+	// DLLimitBytes is the downlink buffer capacity -- the DL denominator.
+	DLLimitBytes uint32
+}
+
+// Downlink qdisc handles on SourceIf. Chosen not to collide with the uplink
+// tree's 1:/10: on the ifb device, so the two are easy to tell apart in
+// `tc qdisc show` output when debugging.
+const (
+	dlRootHandle = "2:"
+	dlClassID    = "2:20"
+	dlLeafHandle = "20:"
+)
+
+// DLEnabled reports whether this spec asks for a downlink buffer.
+func (s EgressBufferSpec) DLEnabled() bool {
+	return s.DLRate != "" && s.DLLimitBytes > 0
 }
 
 func run(log *logrus.Entry, args ...string) error {
@@ -73,8 +94,9 @@ func runIgnore(args ...string) {
 	_ = exec.Command(args[0], args[1:]...).Run()
 }
 
-// SetupEgressBuffer builds the buffer. It is idempotent: an existing buffer is
-// torn down and rebuilt, so a UPF restart does not inherit a half-built tree.
+// SetupEgressBuffer builds the uplink buffer and, when DLRate is set, the
+// downlink one. It is idempotent: an existing tree is torn down and rebuilt,
+// so a UPF restart does not inherit a half-built one.
 func SetupEgressBuffer(spec EgressBufferSpec, log *logrus.Entry) error {
 	if spec.IfName == "" || spec.SourceIf == "" {
 		return fmt.Errorf("egress buffer: ifname and sourceIf are required")
@@ -132,14 +154,47 @@ func SetupEgressBuffer(spec EgressBufferSpec, log *logrus.Entry) error {
 		return err
 	}
 
-	log.Infof("egress buffer ready: %s ingress -> %s, htb %s, bfifo limit %d B",
+	log.Infof("uplink buffer ready: %s ingress -> %s, htb %s, bfifo limit %d B",
 		spec.SourceIf, spec.IfName, spec.Rate, spec.LimitBytes)
+
+	if spec.DLEnabled() {
+		if err := setupDownlinkBuffer(spec, log); err != nil {
+			return fmt.Errorf("downlink buffer: %w", err)
+		}
+	}
 	return nil
 }
 
-// TeardownEgressBuffer removes what SetupEgressBuffer built.
+// setupDownlinkBuffer puts a bounded queue on the gtp5g link's EGRESS, which
+// is the downlink path toward the gNB. No ifb is needed: unlike ingress, an
+// egress root qdisc can queue.
+func setupDownlinkBuffer(spec EgressBufferSpec, log *logrus.Entry) error {
+	runIgnore("tc", "qdisc", "del", "dev", spec.SourceIf, "root")
+
+	if err := run(log, "tc", "qdisc", "add", "dev", spec.SourceIf,
+		"root", "handle", dlRootHandle, "htb", "default", "20"); err != nil {
+		return err
+	}
+	if err := run(log, "tc", "class", "add", "dev", spec.SourceIf,
+		"parent", dlRootHandle, "classid", dlClassID, "htb",
+		"rate", spec.DLRate, "ceil", spec.DLRate, "burst", "8k"); err != nil {
+		return err
+	}
+	if err := run(log, "tc", "qdisc", "add", "dev", spec.SourceIf,
+		"parent", dlClassID, "handle", dlLeafHandle, "bfifo",
+		"limit", fmt.Sprintf("%d", spec.DLLimitBytes)); err != nil {
+		return err
+	}
+	log.Infof("downlink buffer ready: %s egress, htb %s, bfifo limit %d B",
+		spec.SourceIf, spec.DLRate, spec.DLLimitBytes)
+	return nil
+}
+
+// TeardownEgressBuffer removes what SetupEgressBuffer built, in both
+// directions.
 func TeardownEgressBuffer(spec EgressBufferSpec) {
 	runIgnore("tc", "qdisc", "del", "dev", spec.SourceIf, "handle", "ffff:", "ingress")
+	runIgnore("tc", "qdisc", "del", "dev", spec.SourceIf, "root")
 	runIgnore("tc", "qdisc", "del", "dev", spec.IfName, "root")
 	runIgnore("ip", "link", "del", spec.IfName)
 }

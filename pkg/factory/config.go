@@ -64,10 +64,11 @@ type Logger struct {
 // Load Control Information (TS 29.244 8.2.54) to CP functions that advertise
 // LOAD (internal/pfcp/load_control.go).
 //
-// The metric is floor(egress buffer bytes / max buffer bytes * 100), time
-// averaged. That requires a BYTE-limited egress queue to measure: a pod's veth
-// is "noqueue" by default and has no buffer at all, so the deployment installs
-// a bounded qdisc on a dedicated interface and names it here.
+// Per direction the metric is floor(buffer bytes / max buffer bytes * 100),
+// time averaged, and the reported value is max(UL, DL). That requires a
+// BYTE-limited queue in each direction: a pod's veth is "noqueue" by default
+// and has no buffer at all, so the UPF installs bounded qdiscs and names them
+// here.
 type LoadConfig struct {
 	Enabled bool `yaml:"enabled" valid:"optional"`
 	// IfName is the interface carrying the egress buffer.
@@ -96,8 +97,18 @@ type LoadConfig struct {
 	// EgressRate is the bottleneck in tc syntax, e.g. "500kbit". Required
 	// when SetupEgress is set: with no bottleneck the buffer never fills.
 	EgressRate string `yaml:"egressRate" valid:"optional"`
-	// EgressBufferBytes is the buffer capacity, the metric's denominator.
+	// EgressBufferBytes is the uplink buffer capacity, the UL denominator.
 	EgressBufferBytes uint32 `yaml:"egressBufferBytes" valid:"optional"`
+
+	// DLEgressRate is the downlink bottleneck, in tc syntax. Empty disables
+	// downlink measurement and the metric becomes uplink-only.
+	//
+	// Downlink is measured on the gtp5g link's EGRESS -- decapsulated user
+	// packets on their way to the gNB -- using the same equation as uplink.
+	// The reported Load Control Information value is the MAX of the two.
+	DLEgressRate string `yaml:"dlEgressRate" valid:"optional"`
+	// DLEgressBufferBytes is the downlink buffer capacity, the DL denominator.
+	DLEgressBufferBytes uint32 `yaml:"dlEgressBufferBytes" valid:"optional"`
 }
 
 func (c *Config) GetVersion() string {
