@@ -28,19 +28,29 @@ type UpfApp struct {
 	pfcpServer *pfcp.PfcpServer
 	eesServer  *ees.Server
 
-	loadTracker *load.Tracker
+	loadMetrics *load.Combiner
 	loadAPI     *load.APIServer
 	loadEgress  *load.EgressBufferSpec
 }
 
-// LoadMetric exposes the current egress load metric (0..100). The PFCP layer
-// will read this when it populates Load Control Information.
+// LoadMetric exposes the node-level load metric (0..100) for PFCP Load
+// Control Information: max(uplink, downlink). The boolean is false when the
+// metric is disabled or any enabled direction is not measuring -- do NOT send
+// Load Control Information in that case.
 func (u *UpfApp) LoadMetric() (uint8, bool) {
-	if u.loadTracker == nil {
+	if u.loadMetrics == nil {
 		return 0, false
 	}
-	m := u.loadTracker.Metric()
+	m := u.loadMetrics.LCI()
 	return m.Value, m.Healthy
+}
+
+// LoadMetricDetail exposes both directions, for diagnostics.
+func (u *UpfApp) LoadMetricDetail() (load.LCI, bool) {
+	if u.loadMetrics == nil {
+		return load.LCI{}, false
+	}
+	return u.loadMetrics.LCI(), true
 }
 
 func NewApp(cfg *factory.Config) (*UpfApp, error) {
@@ -256,11 +266,17 @@ func (u *UpfApp) initLoadMetric() error {
 		if bufBytes == 0 {
 			bufBytes = 65536
 		}
+		dlBufBytes := cfg.DLEgressBufferBytes
+		if dlBufBytes == 0 {
+			dlBufBytes = bufBytes // same capacity as uplink unless overridden
+		}
 		u.loadEgress = &load.EgressBufferSpec{
-			IfName:     ifname,
-			SourceIf:   srcIf,
-			Rate:       cfg.EgressRate,
-			LimitBytes: bufBytes,
+			IfName:       ifname,
+			SourceIf:     srcIf,
+			Rate:         cfg.EgressRate,
+			LimitBytes:   bufBytes,
+			DLRate:       cfg.DLEgressRate,
+			DLLimitBytes: dlBufBytes,
 		}
 		if err := load.SetupEgressBuffer(*u.loadEgress, logger.LoadLog); err != nil {
 			u.loadEgress = nil
@@ -277,19 +293,45 @@ func (u *UpfApp) initLoadMetric() error {
 		window = 2 * time.Second
 	}
 
-	u.loadTracker = load.NewTracker(interval, window, ifname)
-	sampler, err := load.NewSampler(u.loadTracker, ifname, kind, interval, logger.LoadLog)
+	// Uplink: the ifb device fed from the gtp5g link's ingress.
+	ulTracker := load.NewTracker(interval, window, ifname)
+	ulSampler, err := load.NewSampler(ulTracker, ifname, kind, load.DirUplink,
+		interval, logger.LoadLog)
 	if err != nil {
-		u.loadTracker = nil
 		return err
 	}
-	sampler.Run(u.ctx, &u.wg)
-	logger.MainLog.Infof(
-		"load metric enabled: %s/%s sampled every %s, averaged over %s",
-		ifname, kind, interval, window)
+	ulSampler.Run(u.ctx, &u.wg)
+
+	// Downlink: the gtp5g link's own egress queue, measured only when the
+	// deployment asked for a downlink bottleneck. Without one the queue never
+	// fills, and a permanent DL 0 would be indistinguishable from an idle
+	// downlink while silently capping max(UL, DL) at the UL value.
+	var dlTracker *load.Tracker
+	if u.loadEgress != nil && u.loadEgress.DLEnabled() {
+		dlTracker = load.NewTracker(interval, window, u.loadEgress.SourceIf)
+		dlSampler, dlErr := load.NewSampler(dlTracker, u.loadEgress.SourceIf,
+			kind, load.DirDownlink, interval, logger.LoadLog)
+		if dlErr != nil {
+			return dlErr
+		}
+		dlSampler.Run(u.ctx, &u.wg)
+	}
+
+	u.loadMetrics = load.NewCombiner(ulTracker, dlTracker)
+	if dlTracker != nil {
+		logger.MainLog.Infof(
+			"load metric enabled: max(UL %s/%s, DL %s/%s) sampled every %s, "+
+				"averaged over %s", ifname, kind, u.loadEgress.SourceIf, kind,
+			interval, window)
+	} else {
+		logger.MainLog.Infof(
+			"load metric enabled: UL only on %s/%s sampled every %s, "+
+				"averaged over %s (no dlEgressRate configured)",
+			ifname, kind, interval, window)
+	}
 
 	if cfg.APIAddr != "" {
-		u.loadAPI = load.NewAPIServer(u.loadTracker, logger.LoadLog)
+		u.loadAPI = load.NewAPIServer(u.loadMetrics, logger.LoadLog)
 		addr := cfg.APIAddr
 		u.wg.Add(1)
 		go func() {
