@@ -59,6 +59,10 @@ type PfcpServer struct {
 	rxTrans      map[string]*RxTransaction // key: RemoteAddr-Sequence
 	txSeq        uint32
 	log          *logrus.Entry
+
+	// Load Control (load_control.go); set before Start.
+	loadMetric LoadMetricSource
+	lciSeq     uint32
 }
 
 func NewPfcpServer(cfg *factory.Config, driver forwarder.Driver) *PfcpServer {

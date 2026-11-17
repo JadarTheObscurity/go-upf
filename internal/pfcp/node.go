@@ -609,6 +609,11 @@ type RemoteNode struct {
 	sess   map[uint64]struct{} // key: Local SEID
 	driver forwarder.Driver
 	log    *logrus.Entry
+
+	// loadControl is true when the CP function advertised LOAD in the CP
+	// Function Features of its Association Setup Request, so it accepts Load
+	// Control Information (TS 29.244 §6.2.3).
+	loadControl bool
 }
 
 func NewRemoteNode(

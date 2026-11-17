@@ -84,6 +84,7 @@ func (s *PfcpServer) serveDLDReport(addr net.Addr, lSeid uint64, pdrid uint16) e
 			*/
 		),
 	)
+	req.LoadControlInformation = s.loadControlIE(sess.rnode)
 
 	err = s.sendReqTo(req, addr)
 	return errors.Wrap(err, "serveDLDReport")
@@ -105,6 +106,7 @@ func (s *PfcpServer) serveUSAReport(addr net.Addr, lSeid uint64, usars []report.
 		0,
 		ie.NewReportType(0, 0, 1, 0),
 	)
+	req.LoadControlInformation = s.loadControlIE(sess.rnode)
 	for _, r := range usars {
 		urrInfo, ok := sess.URRIDs[r.URRID]
 		if !ok {

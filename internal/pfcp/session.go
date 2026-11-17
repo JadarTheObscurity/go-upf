@@ -183,6 +183,7 @@ func (s *PfcpServer) handleSessionEstablishmentRequest(
 		0, // pri
 		ies...,
 	)
+	rsp.LoadControlInformation = s.loadControlIE(rnode)
 
 	err = s.sendRspTo(rsp, addr)
 	if err != nil {
@@ -524,6 +525,7 @@ func (s *PfcpServer) handleSessionModificationRequest(
 		0, // pri
 		ie.NewCause(ie.CauseRequestAccepted),
 	)
+	rsp.LoadControlInformation = s.loadControlIE(sess.rnode)
 	for _, r := range usars {
 		urrInfo, ok := sess.URRIDs[r.URRID]
 		if !ok {
@@ -586,6 +588,7 @@ func (s *PfcpServer) handleSessionDeletionRequest(
 		0, // pri
 		ie.NewCause(ie.CauseRequestAccepted),
 	)
+	rsp.LoadControlInformation = s.loadControlIE(sess.rnode)
 	for _, r := range usars {
 		urrInfo, ok := sess.URRIDs[r.URRID]
 		if !ok {

@@ -55,6 +55,8 @@ func (s *PfcpServer) handleAssociationSetupRequest(
 		delete(s.rnodes, rnodeid)
 	}
 	node := s.NewNode(rnodeid, addr, s.driver)
+	node.loadControl = req.CPFunctionFeatures != nil && req.CPFunctionFeatures.HasLOAD()
+	node.log.Infof("CP function supports Load Control: %v", node.loadControl)
 	s.rnodes[rnodeid] = node
 
 	rsp := message.NewAssociationSetupResponse(

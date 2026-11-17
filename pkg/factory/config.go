@@ -60,8 +60,9 @@ type Logger struct {
 	ReportCaller bool   `yaml:"reportCaller" valid:"optional"`
 }
 
-// LoadConfig controls the egress load metric (0..100) that will later be
-// carried in PFCP Load Control Information (TS 29.244 8.2.54).
+// LoadConfig controls the egress load metric (0..100) that is carried in PFCP
+// Load Control Information (TS 29.244 8.2.54) to CP functions that advertise
+// LOAD (internal/pfcp/load_control.go).
 //
 // The metric is floor(egress buffer bytes / max buffer bytes * 100), time
 // averaged. That requires a BYTE-limited egress queue to measure: a pod's veth
@@ -89,7 +90,8 @@ type LoadConfig struct {
 	// carrying it (upfgtp) is created by the UPF process.
 	SetupEgress bool `yaml:"setupEgress" valid:"optional"`
 	// EgressSourceIf is the interface whose ingress is redirected into the
-	// buffer; normally the gtp5g link.
+	// buffer; empty means the gtp5g link, which is always "upfgtp" in this
+	// version.
 	EgressSourceIf string `yaml:"egressSourceIf" valid:"optional"`
 	// EgressRate is the bottleneck in tc syntax, e.g. "500kbit". Required
 	// when SetupEgress is set: with no bottleneck the buffer never fills.

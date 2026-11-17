@@ -31,7 +31,7 @@ type UpfApp struct {
 }
 
 // LoadMetric exposes the current egress load metric (0..100). The PFCP layer
-// will read this when it populates Load Control Information.
+// reads it to populate Load Control Information.
 func (u *UpfApp) LoadMetric() (uint8, bool) {
 	if u.loadTracker == nil {
 		return 0, false
@@ -93,17 +93,23 @@ func (u *UpfApp) Run() error {
 		return err
 	}
 
-	u.pfcpServer = pfcp.NewPfcpServer(u.cfg, u.driver)
-	u.driver.HandleReport(u.pfcpServer)
-	u.pfcpServer.Start(&u.wg)
-
 	// The load metric must be available as soon as the pod is up, so it is
 	// started here, before the UPF reports itself started. A failure to set it
 	// up is logged, not fatal: it is telemetry, and the forwarding plane is
-	// already serving traffic by this point.
+	// already serving traffic by this point. It runs after the forwarder,
+	// which creates upfgtp, and before the PFCP server starts, so the PFCP
+	// goroutine sees the tracker without further synchronization.
 	if err := u.initLoadMetric(); err != nil {
 		logger.MainLog.Errorf("load metric disabled: %v", err)
 	}
+
+	u.pfcpServer = pfcp.NewPfcpServer(u.cfg, u.driver)
+	if u.loadTracker != nil {
+		// Carry the metric in PFCP Load Control Information.
+		u.pfcpServer.SetLoadMetricSource(u.LoadMetric)
+	}
+	u.driver.HandleReport(u.pfcpServer)
+	u.pfcpServer.Start(&u.wg)
 
 	logger.MainLog.Infoln("UPF started")
 
@@ -190,15 +196,10 @@ func (u *UpfApp) initLoadMetric() error {
 	if cfg.SetupEgress {
 		srcIf := cfg.EgressSourceIf
 		if srcIf == "" {
-			// Fall back to the configured gtp5g link name, guarding the
-			// slice: IfList is optional in the config schema, so indexing it
-			// unconditionally would panic on a config that omits it.
-			if u.cfg.Gtpu != nil && len(u.cfg.Gtpu.IfList) > 0 {
-				srcIf = u.cfg.Gtpu.IfList[0].IfName
-			}
-			if srcIf == "" {
-				srcIf = "upfgtp"
-			}
+			// go-upf v1.2.13 always names the gtp5g link "upfgtp"
+			// (internal/forwarder/gtp5glink.go); gtpu.ifList[].ifname
+			// does not rename it in this version.
+			srcIf = "upfgtp"
 		}
 		bufBytes := cfg.EgressBufferBytes
 		if bufBytes == 0 {
