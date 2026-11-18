@@ -63,6 +63,7 @@ type Tracker struct {
 	maxBytes  uint32
 	pkts      uint32
 	drops     uint32
+	last      QdiscStats // the reading as the sampler saw it, for the exporter
 	healthy   bool
 	lastErr   string
 	updatedAt time.Time
@@ -78,6 +79,22 @@ func NewTracker(sampleInterval, window time.Duration, source string) *Tracker {
 		alpha = 1 - math.Exp(-sampleInterval.Seconds()/window.Seconds())
 	}
 	return &Tracker{alpha: alpha, source: source}
+}
+
+// ObserveQdisc folds a whole qdisc reading in, keeping the cumulative
+// forwarded counters the exporter needs alongside the derived metric.
+func (t *Tracker) ObserveQdisc(q QdiscStats) {
+	t.Observe(q.BacklogB, q.LimitB, q.BacklogPkt, q.Drops)
+	t.mu.Lock()
+	t.last = q
+	t.mu.Unlock()
+}
+
+// Last returns the most recent qdisc reading.
+func (t *Tracker) Last() QdiscStats {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.last
 }
 
 // Observe folds one reading of the egress buffer into the average.

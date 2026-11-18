@@ -122,6 +122,36 @@ type LoadConfig struct {
 	DLEgressRate string `yaml:"dlEgressRate" valid:"optional"`
 	// DLEgressBufferBytes is the downlink buffer capacity, the DL denominator.
 	DLEgressBufferBytes uint32 `yaml:"dlEgressBufferBytes" valid:"optional"`
+
+	// MetricsAddr serves Prometheus metrics at <addr>/metrics. Empty disables
+	// the exporter. The chart's PodMonitor scrapes a container port named
+	// "metrics", so this normally binds 0.0.0.0 on that port.
+	MetricsAddr string `yaml:"metricsAddr" valid:"optional"`
+	// PerUEMetrics exports per-UE counters read from /proc/gtp5g/pdr. That
+	// walk is far more expensive than a qdisc dump, so it is opt-in and
+	// cached; see PerUECacheMs.
+	PerUEMetrics bool `yaml:"perUeMetrics" valid:"optional"`
+	// PerUECacheMs is how long a per-UE scan is reused. 0 uses 2000 ms.
+	PerUECacheMs int `yaml:"perUeCacheMs" valid:"optional"`
+	// PerUEMaxSessions bounds the SEID space the per-UE scan walks. The
+	// procfs interface cannot enumerate rules, so the scan probes a range.
+	PerUEMaxSessions int `yaml:"perUeMaxSessions" valid:"optional"`
+
+	// PerUEQueues gives every UE its own shaper class, so PACKET LOSS can be
+	// attributed to the UE that suffered it.
+	//
+	// Without this the egress buffer is one shared queue: its drop counter is
+	// an aggregate, and gtp5g's per-PDR drop counters stay at zero because
+	// they count datapath discards, not shaper drops -- the per-PDR
+	// "forwarded" count is taken BEFORE the shaper. Measured on a loaded UPF:
+	// 38,786 aggregate drops with every per-PDR ul_drops still 0x0.
+	//
+	// It also makes per-UE forwarding roughly fair under equal load, where a
+	// single shared FIFO is drop-tail unfair.
+	PerUEQueues bool `yaml:"perUeQueues" valid:"optional"`
+	// PerUEQueueMax bounds how many per-UE classes are created. A UE beyond
+	// this falls into the default class and is not measured separately.
+	PerUEQueueMax int `yaml:"perUeQueueMax" valid:"optional"`
 }
 
 func (c *Config) GetVersion() string {

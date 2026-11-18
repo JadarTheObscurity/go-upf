@@ -56,6 +56,7 @@ const (
 	tcaOptions = 2 // TCA_OPTIONS - kind-specific; for *fifo it is tc_fifo_qopt
 	tcaStats2  = 7 // TCA_STATS2  - nested, holds the queue stats
 
+	tcaStatsBasic = 1 // TCA_STATS_BASIC inside TCA_STATS2 - bytes/packets sent
 	tcaStatsQueue = 3 // TCA_STATS_QUEUE inside TCA_STATS2
 
 	sizeofTcmsg = 20 // struct tcmsg
@@ -63,13 +64,21 @@ const (
 
 // QdiscStats is one egress buffer's occupancy and capacity, both in bytes.
 type QdiscStats struct {
-	Kind       string
-	Ifindex    int
-	Handle     uint32
+	Kind    string
+	Ifindex int
+	Handle  uint32
+	// Parent is the class this qdisc hangs under. For a per-UE leaf it is the
+	// UE's class id, which is how a leaf's counters are attributed to a UE.
+	Parent     uint32
 	BacklogB   uint32 // bytes currently queued -- the egress buffer size
 	BacklogPkt uint32 // packets currently queued, for diagnostics
 	LimitB     uint32 // the queue's capacity -- the max buffer size
 	Drops      uint32
+	// Cumulative forwarded totals, for throughput. Exported as Prometheus
+	// counters so rate() can derive throughput: a pre-computed rate would
+	// depend on the exporter's own sampling interval.
+	SentBytes uint64
+	SentPkts  uint64
 }
 
 // tcmsg mirrors struct tcmsg. Only Ifindex is set on a dump request; the
@@ -203,7 +212,11 @@ func (r *QdiscReader) Dump(ifindex int) ([]QdiscStats, error) {
 			if ifindex != 0 && int(tm.Ifindex) != ifindex {
 				continue
 			}
-			st := QdiscStats{Handle: tm.Handle, Ifindex: int(tm.Ifindex)}
+			st := QdiscStats{
+				Handle:  tm.Handle,
+				Parent:  tm.Parent,
+				Ifindex: int(tm.Ifindex),
+			}
 			if err := parseQdiscAttrs(msg.Data[sizeofTcmsg:], &st); err != nil {
 				continue // one unparseable qdisc must not hide the others
 			}
@@ -266,6 +279,11 @@ func parseStats2(b []byte, st *QdiscStats) {
 		if !ok {
 			return
 		}
+		if typ == tcaStatsBasic && len(val) >= 12 {
+			// struct gnet_stats_basic{__u64 bytes; __u32 packets;}
+			st.SentBytes = native.Uint64(val[0:8])
+			st.SentPkts = uint64(native.Uint32(val[8:12]))
+		}
 		if typ == tcaStatsQueue && len(val) >= 12 {
 			// struct gnet_stats_queue{qlen,backlog,drops,requeues,overlimits}
 			st.BacklogPkt = native.Uint32(val[0:4])
@@ -283,4 +301,71 @@ func indexByte(b []byte, c byte) int {
 		}
 	}
 	return -1
+}
+
+// LeafStats returns every qdisc of the given kind on an interface, keyed by
+// the MINOR number of its parent class. For a per-UE tree built by PerUEQueue
+// that minor is 10+slot, so the caller can map a leaf's counters back to the
+// UE occupying that slot.
+//
+// This is how per-UE loss is read: each UE's class has its own leaf, and that
+// leaf's drop counter counts only that UE's discarded packets.
+func (r *QdiscReader) LeafStats(ifindex int, kind string) (map[uint16]QdiscStats, error) {
+	all, err := r.Dump(ifindex)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[uint16]QdiscStats, len(all))
+	for _, q := range all {
+		if q.Kind != kind {
+			continue
+		}
+		// A tc handle is major:minor packed as 0xMMMMmmmm.
+		out[uint16(q.Parent&0xffff)] = q
+	}
+	return out, nil
+}
+
+// ClassMinor extracts the minor number from a tc handle.
+func ClassMinor(handle uint32) uint16 { return uint16(handle & 0xffff) }
+
+// AggregateLeaves sums every leaf of the given kind on an interface, excluding
+// the default class, and reports the total as one QdiscStats.
+//
+// With a per-UE tree there is no single queue to read, so the load metric's
+// numerator is the sum of the UE queues' backlogs and its denominator is the
+// sum of their limits. That keeps the metric describing "how full is this
+// direction's egress buffer" rather than silently tracking whichever UE
+// happens to occupy one leaf.
+//
+// defaultMinor is the minor of the class that catches non-UE traffic; its
+// queue is excluded so PFCP and SBI packets never inflate the user-plane
+// load figure.
+func (r *QdiscReader) AggregateLeaves(ifindex int, kind string,
+	defaultMinor uint16,
+) (QdiscStats, error) {
+	leaves, err := r.LeafStats(ifindex, kind)
+	if err != nil {
+		return QdiscStats{}, err
+	}
+	var agg QdiscStats
+	agg.Kind = kind
+	agg.Ifindex = ifindex
+	n := 0
+	for minor, q := range leaves {
+		if minor == defaultMinor {
+			continue
+		}
+		agg.BacklogB += q.BacklogB
+		agg.BacklogPkt += q.BacklogPkt
+		agg.LimitB += q.LimitB
+		agg.Drops += q.Drops
+		agg.SentBytes += q.SentBytes
+		agg.SentPkts += q.SentPkts
+		n++
+	}
+	if n == 0 {
+		return QdiscStats{}, fmt.Errorf("no %q leaves on ifindex %d", kind, ifindex)
+	}
+	return agg, nil
 }

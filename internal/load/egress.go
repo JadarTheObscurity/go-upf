@@ -59,6 +59,43 @@ type EgressBufferSpec struct {
 	DLRate string
 	// DLLimitBytes is the downlink buffer capacity -- the DL denominator.
 	DLLimitBytes uint32
+
+	// PerUE gives every UE its own class and leaf, so packet loss can be
+	// attributed to the UE that suffered it. With a single shared queue the
+	// drop counter is an aggregate and nothing can say which UE lost
+	// packets. MaxUEs bounds how many classes are created.
+	PerUE  bool
+	MaxUEs int
+}
+
+// ULQueue and DLQueue describe the per-UE trees for each direction.
+func (s EgressBufferSpec) ULQueue() PerUEQueue {
+	return PerUEQueue{
+		Dev: s.IfName, Root: "1:", SharedRate: s.Rate,
+		PerUELimitBytes: perUELimit(s.LimitBytes, s.MaxUEs), MaxUEs: s.MaxUEs,
+	}
+}
+
+func (s EgressBufferSpec) DLQueue() PerUEQueue {
+	return PerUEQueue{
+		Dev: s.SourceIf, Root: dlRootHandle, SharedRate: s.DLRate,
+		PerUELimitBytes: perUELimit(s.DLLimitBytes, s.MaxUEs), MaxUEs: s.MaxUEs,
+	}
+}
+
+// perUELimit splits the configured buffer across the UE classes. The shared
+// total is kept roughly constant so the aggregate load metric still describes
+// the same amount of buffering as the single-queue shape did; a floor keeps a
+// per-UE queue large enough to hold a few packets.
+func perUELimit(total uint32, maxUEs int) uint32 {
+	if maxUEs <= 0 {
+		maxUEs = 16
+	}
+	per := total / uint32(maxUEs)
+	if per < 8192 {
+		per = 8192
+	}
+	return per
 }
 
 // Downlink qdisc handles on SourceIf. Chosen not to collide with the uplink
@@ -113,6 +150,7 @@ func SetupEgressBuffer(spec EgressBufferSpec, log *logrus.Entry) error {
 	// Clean slate.
 	runIgnore("tc", "qdisc", "del", "dev", spec.SourceIf, "handle", "ffff:", "ingress")
 	runIgnore("tc", "qdisc", "del", "dev", spec.IfName, "root")
+	runIgnore("tc", "qdisc", "del", "dev", spec.SourceIf, "root")
 
 	// The ifb device may already exist from a previous run in this netns.
 	if err := run(log, "ip", "link", "add", spec.IfName, "type", "ifb"); err != nil {
@@ -138,24 +176,29 @@ func SetupEgressBuffer(spec EgressBufferSpec, log *logrus.Entry) error {
 		return err
 	}
 
-	// The bottleneck, then the byte-bounded buffer the metric reads.
-	if err := run(log, "tc", "qdisc", "add", "dev", spec.IfName,
-		"root", "handle", "1:", "htb", "default", "10"); err != nil {
-		return err
+	// The bottleneck, then the byte-bounded buffer(s) the metric reads.
+	if spec.PerUE {
+		if err := spec.ULQueue().Build(log); err != nil {
+			return fmt.Errorf("uplink per-UE queues: %w", err)
+		}
+	} else {
+		if err := run(log, "tc", "qdisc", "add", "dev", spec.IfName,
+			"root", "handle", "1:", "htb", "default", "10"); err != nil {
+			return err
+		}
+		if err := run(log, "tc", "class", "add", "dev", spec.IfName,
+			"parent", "1:", "classid", "1:10", "htb",
+			"rate", spec.Rate, "ceil", spec.Rate, "burst", "8k"); err != nil {
+			return err
+		}
+		if err := run(log, "tc", "qdisc", "add", "dev", spec.IfName,
+			"parent", "1:10", "handle", "10:", "bfifo",
+			"limit", fmt.Sprintf("%d", spec.LimitBytes)); err != nil {
+			return err
+		}
+		log.Infof("uplink buffer ready: %s ingress -> %s, htb %s, bfifo limit %d B",
+			spec.SourceIf, spec.IfName, spec.Rate, spec.LimitBytes)
 	}
-	if err := run(log, "tc", "class", "add", "dev", spec.IfName,
-		"parent", "1:", "classid", "1:10", "htb",
-		"rate", spec.Rate, "ceil", spec.Rate, "burst", "8k"); err != nil {
-		return err
-	}
-	if err := run(log, "tc", "qdisc", "add", "dev", spec.IfName,
-		"parent", "1:10", "handle", "10:", "bfifo",
-		"limit", fmt.Sprintf("%d", spec.LimitBytes)); err != nil {
-		return err
-	}
-
-	log.Infof("uplink buffer ready: %s ingress -> %s, htb %s, bfifo limit %d B",
-		spec.SourceIf, spec.IfName, spec.Rate, spec.LimitBytes)
 
 	if spec.DLEnabled() {
 		if err := setupDownlinkBuffer(spec, log); err != nil {
@@ -170,6 +213,10 @@ func SetupEgressBuffer(spec EgressBufferSpec, log *logrus.Entry) error {
 // egress root qdisc can queue.
 func setupDownlinkBuffer(spec EgressBufferSpec, log *logrus.Entry) error {
 	runIgnore("tc", "qdisc", "del", "dev", spec.SourceIf, "root")
+
+	if spec.PerUE {
+		return spec.DLQueue().Build(log)
+	}
 
 	if err := run(log, "tc", "qdisc", "add", "dev", spec.SourceIf,
 		"root", "handle", dlRootHandle, "htb", "default", "20"); err != nil {

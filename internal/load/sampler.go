@@ -5,6 +5,7 @@ package load
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -16,13 +17,18 @@ import (
 
 // Sampler periodically reads the egress buffer and updates the Tracker.
 type Sampler struct {
-	reader   *QdiscReader
-	tracker  *Tracker
-	ifname   string
-	kind     string
-	dir      Direction
-	interval time.Duration
-	log      *logrus.Entry
+	reader  *QdiscReader
+	tracker *Tracker
+	ifname  string
+	kind    string
+	dir     Direction
+	// perUE selects how the buffer is read: a single leaf, or the sum of the
+	// per-UE leaves. With a per-UE tree, reading one leaf would track one UE
+	// rather than the direction.
+	perUE        bool
+	defaultMinor uint16
+	interval     time.Duration
+	log          *logrus.Entry
 
 	// The interface index is resolved lazily and re-resolved on failure: the
 	// egress device may be created slightly after the UPF starts, and the
@@ -44,6 +50,13 @@ func NewSampler(tracker *Tracker, ifname, kind string, dir Direction,
 		reader: reader, tracker: tracker, ifname: ifname,
 		kind: kind, dir: dir, interval: interval, log: log,
 	}, nil
+}
+
+// ReadAggregate makes the sampler sum the per-UE leaves instead of reading a
+// single one. defaultMinor names the non-UE class to exclude.
+func (s *Sampler) ReadAggregate(defaultMinor uint16) {
+	s.perUE = true
+	s.defaultMinor = defaultMinor
 }
 
 // Run samples until ctx is cancelled.
@@ -73,7 +86,12 @@ func (s *Sampler) sampleOnce() {
 		s.tracker.ObserveError(err)
 		return
 	}
-	q, err := s.reader.FindByKind(idx, s.kind)
+	var q QdiscStats
+	if s.perUE {
+		q, err = s.reader.AggregateLeaves(idx, s.kind, s.defaultMinor)
+	} else {
+		q, err = s.reader.FindByKind(idx, s.kind)
+	}
 	if err != nil {
 		// The device may have been recreated with a new index; force a
 		// re-resolve on the next tick rather than failing forever.
@@ -90,8 +108,19 @@ func (s *Sampler) sampleOnce() {
 			s.kind, s.ifname))
 		return
 	}
-	s.tracker.Observe(q.BacklogB, q.LimitB, q.BacklogPkt, q.Drops)
+	s.tracker.ObserveQdisc(q)
 }
+
+// ifindexByName resolves an interface name once, for callers that cache it.
+func ifindexByName(name string) (int, error) {
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		return 0, fmt.Errorf("interface %q not found: %w", name, err)
+	}
+	return iface.Index, nil
+}
+
+var errNoLeaf = errors.New("no leaf qdisc for that class slot")
 
 func (s *Sampler) resolveIfindex() (int, error) {
 	s.mu.Lock()

@@ -16,7 +16,10 @@
 // sessions away from this UPF should do so when EITHER direction is congested.
 package load
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Direction identifies which user-plane direction a reading belongs to.
 type Direction string
@@ -95,4 +98,24 @@ func (c *Combiner) LCI() LCI {
 		out.UpdatedAt = dm.UpdatedAt
 	}
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// Access for a metrics exporter
+// ---------------------------------------------------------------------------
+
+// DirectionStats returns the last qdisc reading for one direction, as the
+// sampler saw it. The exporter uses this rather than taking its own netlink
+// dump: the sampler is already reading these buffers several times a second,
+// so a scrape should cost nothing extra and should report exactly the numbers
+// the metric was computed from.
+func (c *Combiner) DirectionStats(dir Direction) (QdiscStats, error) {
+	t := c.ul
+	if dir == DirDownlink {
+		t = c.dl
+	}
+	if t == nil {
+		return QdiscStats{}, fmt.Errorf("direction %s is not being measured", dir)
+	}
+	return t.Last(), nil
 }

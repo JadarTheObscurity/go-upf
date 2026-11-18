@@ -16,6 +16,7 @@ import (
 	"github.com/free5gc/go-upf/internal/forwarder"
 	"github.com/free5gc/go-upf/internal/load"
 	"github.com/free5gc/go-upf/internal/logger"
+	"github.com/free5gc/go-upf/internal/metrics"
 	"github.com/free5gc/go-upf/internal/pfcp"
 	"github.com/free5gc/go-upf/pkg/factory"
 )
@@ -30,7 +31,11 @@ type UpfApp struct {
 
 	loadMetrics *load.Combiner
 	loadAPI     *load.APIServer
+	promExport  *metrics.Exporter
 	loadEgress  *load.EgressBufferSpec
+	// ueTrackers keep one shaper class per UE per direction, so each UE's
+	// packet loss lands in a counter of its own.
+	ueTrackers []*load.UETracker
 }
 
 // LoadMetric exposes the node-level load metric (0..100) for PFCP Load
@@ -162,6 +167,13 @@ func (u *UpfApp) listenShutdownEvent() {
 	if u.loadEgress != nil {
 		load.TeardownEgressBuffer(*u.loadEgress)
 	}
+	if u.promExport != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := u.promExport.Shutdown(shutdownCtx); err != nil {
+			logger.MainLog.Errorf("Prometheus exporter Shutdown Error: %v", err)
+		}
+	}
 	if u.loadAPI != nil {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -280,6 +292,10 @@ func (u *UpfApp) initLoadMetric() error {
 		if dlBufBytes == 0 {
 			dlBufBytes = bufBytes // same capacity as uplink unless overridden
 		}
+		maxUEs := cfg.PerUEQueueMax
+		if maxUEs <= 0 {
+			maxUEs = 16
+		}
 		u.loadEgress = &load.EgressBufferSpec{
 			IfName:       ifname,
 			SourceIf:     srcIf,
@@ -287,6 +303,8 @@ func (u *UpfApp) initLoadMetric() error {
 			LimitBytes:   bufBytes,
 			DLRate:       cfg.DLEgressRate,
 			DLLimitBytes: dlBufBytes,
+			PerUE:        cfg.PerUEQueues,
+			MaxUEs:       maxUEs,
 		}
 		if err := load.SetupEgressBuffer(*u.loadEgress, logger.LoadLog); err != nil {
 			u.loadEgress = nil
@@ -310,21 +328,69 @@ func (u *UpfApp) initLoadMetric() error {
 	if err != nil {
 		return err
 	}
-	ulSampler.Run(u.ctx, &u.wg)
-
 	// Downlink: the gtp5g link's own egress queue, measured only when the
 	// deployment asked for a downlink bottleneck. Without one the queue never
 	// fills, and a permanent DL 0 would be indistinguishable from an idle
 	// downlink while silently capping max(UL, DL) at the UL value.
 	var dlTracker *load.Tracker
+	var dlSampler *load.Sampler
 	if u.loadEgress != nil && u.loadEgress.DLEnabled() {
 		dlTracker = load.NewTracker(interval, window, u.loadEgress.SourceIf)
-		dlSampler, dlErr := load.NewSampler(dlTracker, u.loadEgress.SourceIf,
+		var dlErr error
+		dlSampler, dlErr = load.NewSampler(dlTracker, u.loadEgress.SourceIf,
 			kind, load.DirDownlink, interval, logger.LoadLog)
 		if dlErr != nil {
 			return dlErr
 		}
+	}
+
+	// With a per-UE tree there is no single leaf to read, so each sampler must
+	// sum the per-UE leaves (excluding the default class at minor 99).
+	// Reading one leaf would make the load metric track one UE.
+	if u.loadEgress != nil && u.loadEgress.PerUE {
+		ulSampler.ReadAggregate(load.DefaultClassMinor)
+		if dlSampler != nil {
+			dlSampler.ReadAggregate(load.DefaultClassMinor)
+		}
+	}
+	ulSampler.Run(u.ctx, &u.wg)
+	if dlSampler != nil {
 		dlSampler.Run(u.ctx, &u.wg)
+	}
+
+	// Per-UE trackers: one filter per UE per direction, so each UE's drops
+	// land in a counter of its own. UEs are discovered from the gtp5g
+	// datapath, which is also where the exporter's session list comes from.
+	if u.loadEgress != nil && u.loadEgress.PerUE {
+		pdr := metrics.NewPDRReader(u.loadEgress.SourceIf,
+			uint64(cfg.PerUEMaxSessions), 0)
+		discover := func() ([]string, error) {
+			st, err := pdr.Scan()
+			if err != nil {
+				return nil, err
+			}
+			out := make([]string, 0, len(st))
+			for addr := range st {
+				out = append(out, addr)
+			}
+			return out, nil
+		}
+		if t, terr := load.NewUETracker(u.loadEgress.ULQueue(),
+			load.DirUplink, discover, logger.LoadLog); terr == nil {
+			t.Run(u.ctx, &u.wg, 5*time.Second)
+			u.ueTrackers = append(u.ueTrackers, t)
+		} else {
+			logger.MainLog.Warnf("uplink per-UE tracker: %v", terr)
+		}
+		if dlTracker != nil {
+			if t, terr := load.NewUETracker(u.loadEgress.DLQueue(),
+				load.DirDownlink, discover, logger.LoadLog); terr == nil {
+				t.Run(u.ctx, &u.wg, 5*time.Second)
+				u.ueTrackers = append(u.ueTrackers, t)
+			} else {
+				logger.MainLog.Warnf("downlink per-UE tracker: %v", terr)
+			}
+		}
 	}
 
 	u.loadMetrics = load.NewCombiner(ulTracker, dlTracker)
@@ -338,6 +404,36 @@ func (u *UpfApp) initLoadMetric() error {
 			"load metric enabled: UL only on %s/%s sampled every %s, "+
 				"averaged over %s (no dlEgressRate configured)",
 			ifname, kind, interval, window)
+	}
+
+	// Prometheus exporter. Separate from the temporary verification endpoint:
+	// that one is to be deleted once PFCP carries the metric, while this is
+	// the lasting monitoring surface the chart's PodMonitor scrapes.
+	if cfg.MetricsAddr != "" {
+		var pdr *metrics.PDRReader
+		if cfg.PerUEMetrics {
+			srcIf := "upfgtp"
+			if u.loadEgress != nil && u.loadEgress.SourceIf != "" {
+				srcIf = u.loadEgress.SourceIf
+			}
+			pdr = metrics.NewPDRReader(srcIf,
+				uint64(cfg.PerUEMaxSessions), 0)
+		}
+		ttl := time.Duration(cfg.PerUECacheMs) * time.Millisecond
+		u.promExport = metrics.NewExporter(u.loadMetrics, u.loadMetrics, pdr,
+			ttl, logger.LoadLog)
+		// Per-UE shaper counters, which is where real per-UE loss lives.
+		for _, t := range u.ueTrackers {
+			u.promExport.AddUELossSource(t)
+		}
+		addr := cfg.MetricsAddr
+		u.wg.Add(1)
+		go func() {
+			defer u.wg.Done()
+			if err := u.promExport.Serve(addr); err != nil {
+				logger.MainLog.Errorf("Prometheus exporter error: %v", err)
+			}
+		}()
 	}
 
 	if cfg.APIAddr != "" {
