@@ -27,7 +27,7 @@ import (
 
 const (
 	expectedMinGtp5gVersion string = "0.9.3"
-	expectedMaxGtp5gVersion string = "0.10.3"
+	expectedMaxGtp5gVersion string = "0.10.4"
 )
 
 type Gtp5g struct {
@@ -43,7 +43,7 @@ type Gtp5g struct {
 	log      *logrus.Entry
 }
 
-func OpenGtp5g(wg *sync.WaitGroup, addr string, mtu uint32) (*Gtp5g, error) {
+func OpenGtp5g(wg *sync.WaitGroup, addr string, mtu uint32, linkName string) (*Gtp5g, error) {
 	g := &Gtp5g{
 		log: logger.FwderLog.WithField(logger_util.FieldCategory, "Gtp5g"),
 	}
@@ -55,14 +55,13 @@ func OpenGtp5g(wg *sync.WaitGroup, addr string, mtu uint32) (*Gtp5g, error) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err = mux.Serve()
-		if err != nil {
-			g.log.Warnf("mux Serve err: %+v", err)
+		if serveErr := mux.Serve(); serveErr != nil {
+			g.log.Warnf("mux Serve err: %+v", serveErr)
 		}
 	}()
 	g.mux = mux
 
-	link, err := OpenGtp5gLink(mux, addr, mtu, g.log)
+	link, err := OpenGtp5gLink(mux, addr, mtu, linkName, g.log)
 	if err != nil {
 		g.Close()
 		return nil, errors.Wrap(err, "open link")
@@ -776,6 +775,9 @@ func (g *Gtp5g) BuildCreatePDRPlan(lSeid uint64, req *ie.IE) (*PDRPlan, error) {
 	var pdrid uint64
 	var attrs []nl.Attr
 	var urrids []uint32
+	var qerids []uint32
+	var hasFarid bool
+	var farid uint32
 
 	ies, err := req.CreatePDR()
 	if err != nil {
@@ -829,6 +831,8 @@ func (g *Gtp5g) BuildCreatePDRPlan(lSeid uint64, req *ie.IE) (*PDRPlan, error) {
 				Type:  gtp5gnl.PDR_FAR_ID,
 				Value: nl.AttrU32(v),
 			})
+			hasFarid = true
+			farid = v
 		case ie.QERID:
 			v, err := i.QERID()
 			if err != nil {
@@ -840,6 +844,7 @@ func (g *Gtp5g) BuildCreatePDRPlan(lSeid uint64, req *ie.IE) (*PDRPlan, error) {
 				Type:  gtp5gnl.PDR_QER_ID,
 				Value: nl.AttrU32(v),
 			})
+			qerids = append(qerids, v)
 		case ie.URRID:
 			v, err := i.URRID()
 			if err != nil {
@@ -874,7 +879,10 @@ func (g *Gtp5g) BuildCreatePDRPlan(lSeid uint64, req *ie.IE) (*PDRPlan, error) {
 		Attrs:      attrs,
 		OriginalIE: req,
 		PDRID:      uint16(pdrid),
+		HasFARID:   hasFarid,
+		FARID:      farid,
 		URRIDs:     urrids,
+		QERIDs:     qerids,
 	}, nil
 }
 
@@ -882,6 +890,9 @@ func (g *Gtp5g) BuildUpdatePDRPlan(lSeid uint64, req *ie.IE) (*PDRPlan, error) {
 	var pdrid uint64
 	var attrs []nl.Attr
 	var urrids []uint32
+	var qerids []uint32
+	var hasFarid bool
+	var farid uint32
 
 	ies, err := req.UpdatePDR()
 	if err != nil {
@@ -939,6 +950,8 @@ func (g *Gtp5g) BuildUpdatePDRPlan(lSeid uint64, req *ie.IE) (*PDRPlan, error) {
 				Type:  gtp5gnl.PDR_FAR_ID,
 				Value: nl.AttrU32(v),
 			})
+			hasFarid = true
+			farid = v
 		case ie.QERID:
 			v, err := i.QERID()
 			if err != nil {
@@ -949,6 +962,7 @@ func (g *Gtp5g) BuildUpdatePDRPlan(lSeid uint64, req *ie.IE) (*PDRPlan, error) {
 				Type:  gtp5gnl.PDR_QER_ID,
 				Value: nl.AttrU32(v),
 			})
+			qerids = append(qerids, v)
 		case ie.URRID:
 			v, err := i.URRID()
 			if err != nil {
@@ -969,7 +983,10 @@ func (g *Gtp5g) BuildUpdatePDRPlan(lSeid uint64, req *ie.IE) (*PDRPlan, error) {
 		Attrs:      attrs,
 		OriginalIE: req,
 		PDRID:      uint16(pdrid),
+		HasFARID:   hasFarid,
+		FARID:      farid,
 		URRIDs:     urrids,
+		QERIDs:     qerids,
 	}, nil
 }
 

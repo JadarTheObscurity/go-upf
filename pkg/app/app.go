@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"runtime/debug"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/free5gc/go-upf/internal/ees"
 	"github.com/free5gc/go-upf/internal/forwarder"
 	"github.com/free5gc/go-upf/internal/load"
 	"github.com/free5gc/go-upf/internal/logger"
@@ -24,6 +26,7 @@ type UpfApp struct {
 	cfg        *factory.Config
 	driver     forwarder.Driver
 	pfcpServer *pfcp.PfcpServer
+	eesServer  *ees.Server
 
 	loadMetrics *load.Combiner
 	loadAPI     *load.APIServer
@@ -121,6 +124,11 @@ func (u *UpfApp) Run() error {
 	u.driver.HandleReport(u.pfcpServer)
 	u.pfcpServer.Start(&u.wg)
 
+	// EES is optional; when disabled nothing below touches the PFCP path.
+	if err := u.initEES(); err != nil {
+		return err
+	}
+
 	logger.MainLog.Infoln("UPF started")
 
 	// Wait for interrupt signal to gracefully shutdown
@@ -161,6 +169,13 @@ func (u *UpfApp) listenShutdownEvent() {
 			logger.MainLog.Errorf("Load metric API Shutdown Error: %v", err)
 		}
 	}
+	if u.eesServer != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := u.eesServer.Shutdown(shutdownCtx); err != nil {
+			logger.MainLog.Errorf("EES API Server Shutdown Error: %v", err)
+		}
+	}
 	if u.driver != nil {
 		u.driver.Close()
 	}
@@ -180,6 +195,43 @@ func (u *UpfApp) Start() {
 func (u *UpfApp) Terminate() {
 	logger.MainLog.Infof("Terminating UPF...")
 	logger.MainLog.Infof("UPF terminated")
+}
+
+// initEES starts the embedded Nupf_EventExposure service when enabled. EES only
+// receives usage through a buffer-only PFCP hook; it never writes the PFCP queue.
+func (u *UpfApp) initEES() error {
+	if u.cfg.EES == nil || !u.cfg.EES.Enabled {
+		return nil
+	}
+	logger.MainLog.Infoln("EES supports only the free5GC single-UPF scenario; keep it disabled in ULCL deployments")
+
+	store := ees.NewSubscriptionStore("")
+	aggregator := ees.NewAggregator(store, ees.NewNotifier(logger.EesLog), logger.EesLog)
+	u.pfcpServer.RegisterEESReportHandler(aggregator.PushReportWithContext)
+
+	u.wg.Add(1)
+	go func() {
+		defer u.wg.Done()
+		aggregator.Run(u.ctx)
+	}()
+
+	port := u.cfg.EES.Port
+	if port == 0 {
+		port = 8088
+	}
+	listenAddr := fmt.Sprintf("%s:%d", u.cfg.EES.IP, port)
+	u.eesServer = ees.NewServer(store, logger.EesLog)
+
+	u.wg.Add(1)
+	go func() {
+		defer u.wg.Done()
+		if err := u.eesServer.Serve(listenAddr); err != nil {
+			logger.MainLog.Errorf("EES API Server Error: %v", err)
+		}
+	}()
+
+	logger.MainLog.Infof("EES started at %s (per-subscription repPeriod, SMF URR 2)", listenAddr)
+	return nil
 }
 
 // initLoadMetric starts the egress load sampler and its temporary internal
@@ -206,10 +258,19 @@ func (u *UpfApp) initLoadMetric() error {
 	if cfg.SetupEgress {
 		srcIf := cfg.EgressSourceIf
 		if srcIf == "" {
-			// go-upf v1.2.13 always names the gtp5g link "upfgtp"
-			// (internal/forwarder/gtp5glink.go); gtpu.ifList[].ifname
-			// does not rename it in this version.
-			srcIf = "upfgtp"
+			// Fall back to the configured gtp5g link name, guarding the
+			// slice: IfList is optional in the config schema, so indexing it
+			// unconditionally would panic on a config that omits it. This
+			// tree honours ifname -- forwarder/driver.go gtpuInterface()
+			// names the device from gtpu.ifList[0].ifname, falling back to
+			// DefaultLinkName -- so hardcoding "upfgtp" would attach the
+			// egress buffer to the wrong device whenever ifname is set.
+			if u.cfg.Gtpu != nil && len(u.cfg.Gtpu.IfList) > 0 {
+				srcIf = u.cfg.Gtpu.IfList[0].IfName
+			}
+			if srcIf == "" {
+				srcIf = "upfgtp"
+			}
 		}
 		bufBytes := cfg.EgressBufferBytes
 		if bufBytes == 0 {
